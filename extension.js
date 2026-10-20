@@ -297,6 +297,41 @@
     return error && error.status === 404;
   }
 
+  // ───────────────────────── 방 모드 확인 ─────────────────────────
+
+  const GAME_MODE_MSG = "게임 모드 방은 지원하지 않습니다 (스토리보드가 그림을 붙들고 있어 변환하면 끊깁니다)";
+  const chatModeCache = new Map(); // chatId → Promise<string|null>
+
+  function chatModeOf(chatId) {
+    if (!chatId) return Promise.resolve(null);
+    if (!chatModeCache.has(chatId)) {
+      const pending = api("GET", `/chats/${encodeURIComponent(chatId)}`).then((chat) =>
+        chat && typeof chat.mode === "string" ? chat.mode : null,
+      );
+      pending.catch(() => chatModeCache.delete(chatId)); // 실패는 캐시하지 않는다
+      chatModeCache.set(chatId, pending);
+    }
+    return chatModeCache.get(chatId);
+  }
+
+  /**
+   * 변환·사본 작업 전에 부른다. 거절 사유 문자열을 돌려주고, 진행해도 되면 null. 방 정보를 못 읽으면 안전하게 거절한다.
+   * 여러 방 id를 주면 하나라도 게임 모드면 거절한다(삽화가 속한 방 기준 — 활성 방이 바뀌는 사이의 틈을 막는다).
+   */
+  async function refuseIfGame(chatIds) {
+    const ids = [...new Set((Array.isArray(chatIds) ? chatIds : [chatIds]).filter(Boolean))];
+    for (const chatId of ids) {
+      let mode;
+      try {
+        mode = await chatModeOf(chatId);
+      } catch (error) {
+        return `방 정보를 읽지 못해 진행하지 않음 (${error instanceof Error ? error.message : String(error)})`;
+      }
+      if (mode === "game") return GAME_MODE_MSG;
+    }
+    return null;
+  }
+
   /** 서버 시계(응답 Date 헤더). 기기 시계가 어긋나도 서버 기준으로 비교하기 위해. 못 읽으면 던진다. */
   async function serverNow() {
     const res = await doFetch("/api/personal-extensions/", { method: "HEAD", cache: "no-store", credentials: "same-origin" });
@@ -1236,6 +1271,14 @@
       return null;
     }
     try {
+      // 삽화가 속한 방 기준으로 검사한다. 활성 방(state.chatId)은 목록을 읽은 뒤 바뀌었을 수 있다.
+      const ownerChatIds = images.map((image) => image?.chatId).filter(Boolean);
+      const refusal = await refuseIfGame(ownerChatIds.length ? ownerChatIds : [state.chatId]);
+      if (refusal) {
+        if (!silent) toast(refusal, "error", 5000);
+        state.lastRunAbort = refusal;
+        return null;
+      }
       if (!(await probeWebpSupport())) {
         if (!silent) toast("이 브라우저는 WebP 인코딩을 지원하지 않습니다. PC 크롬·엣지에서 실행해 주세요.", "error", 5000);
         state.lastRunAbort = "WebP 인코딩 미지원";
@@ -1399,6 +1442,8 @@
     if (!chatId) return toast("활성 채팅방을 찾지 못했습니다", "error");
     if (!state.settings.copyCharacters && !state.settings.copyPersonas)
       return toast("사본을 올릴 갤러리를 먼저 선택하세요 (캐릭터 / 페르소나)", "info", 4000);
+    const refusal = await refuseIfGame(chatId);
+    if (refusal) return toast(refusal, "error", 5000);
     const run = { kind: "copies", preparing: true, total: 0, done: 0, failed: 0, skipped: 0, before: 0, after: 0, copied: 0, cancelled: false };
     if (!acquireRun(run)) return toast("이미 진행 중인 작업이 있습니다", "error");
     try {
@@ -1548,6 +1593,11 @@
     if (document.hidden && !force) return; // 보이지 않는 탭에서는 쉰다
     state.autoBusy = true;
     try {
+      const refusal = await refuseIfGame(state.chatId);
+      if (refusal) {
+        setAutoStatus(refusal, refusal !== GAME_MODE_MSG);
+        return;
+      }
       if (!(await probeWebpSupport())) {
         setAutoStatus("이 브라우저는 WebP 인코딩을 지원하지 않습니다", true);
         return;
@@ -1611,8 +1661,19 @@
 
   const ROOT_SEL = '[data-chat-settings-section$="-gallery"], .mari-window[data-window$="-gallery"]';
 
+  /**
+   * 게임 모드 갤러리(섹션 id `game-gallery`, 창 id `drawer:chat-settings:game-gallery`)에는 들어가지 않는다.
+   * 게임 모드 삽화는 메시지 첨부가 아니라 스토리보드 키프레임이 그림 id로 붙들고 있고, 그 연결을 고칠 API가 없어
+   * 변환 뒤 PNG를 지우면 스토리보드 그림이 끊긴다.
+   */
+  const GAME_ROOT_RE = /(^|:)game-gallery$/;
+  function isGameGalleryRoot(el) {
+    const id = el.getAttribute("data-chat-settings-section") || el.getAttribute("data-window") || "";
+    return GAME_ROOT_RE.test(id);
+  }
+
   function galleryRoots() {
-    return [...document.querySelectorAll(ROOT_SEL)].filter((el) => !el.hidden);
+    return [...document.querySelectorAll(ROOT_SEL)].filter((el) => !el.hidden && !isGameGalleryRoot(el));
   }
 
   function selectionRow(root) {
@@ -1754,7 +1815,7 @@
   }
 
   function applyColumns() {
-    for (const root of document.querySelectorAll(ROOT_SEL)) applyColumnsTo(root);
+    for (const root of galleryRoots()) applyColumnsTo(root);
   }
 
   // ───────────────────────── 설정 팝오버 ─────────────────────────
