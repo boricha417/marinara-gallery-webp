@@ -2,7 +2,8 @@
   "use strict";
 
   // ─────────────────────────────────────────────
-  // 갤러리 webp 변환 v1.8.1
+  // 갤러리 webp 변환 v1.8.3
+  // v1.8.3: 자동 변환에서 영구 사유로 건너뛴 삽화도 실패와 같이 3번까지만 재시도(무한 재조회·토스트 반복 방지).
   //
   // v1.8.1: 교체 뒤 확인에서 고친 메시지는 반드시 서버에서 다시 읽음(스와이프 기록, 없으면 방 목록 재수신),
   //         새로고침 복구용 잠금 표 기억을 localStorage→sessionStorage로(다른 탭의 표를 내 것으로 오인하지 않음).
@@ -135,7 +136,7 @@
     autoTimer: null,
     autoBusy: false,
     autoFirstSeen: new Map(), // 자동 변환 점검에서 그림을 처음 본 시각(이 기기 기준) — 기기 시계와 서버 시계 차이를 타지 않는다
-    autoFailures: new Map(), // 이미지 id → 자동 변환 실패 횟수 (3번까지 다시 시도)
+    autoFailures: new Map(), // 이미지 id → 자동 변환 실패·영구 건너뜀 횟수 (3번까지 다시 시도)
     autoStatus: { lastCheck: null, note: "", error: null }, // 설정 팝오버에 보여 주는 점검 상태
     autoLastToastedError: null,
     remoteLockInfo: null, // 다른 탭·기기의 작업 표(팝오버에서 수동 해제용)
@@ -1258,6 +1259,7 @@
       failed: 0,
       skipped: 0,
       failedIds: [],
+      skippedIds: [], // 영구 사유로 건너뛴 삽화 (자동 변환 재시도 횟수에 포함)
       skipReasons: new Map(),
       before: 0,
       after: 0,
@@ -1314,7 +1316,9 @@
             run.waitingForGeneration = false;
             if (!quiet) {
               quietGaveUp = true;
-              throw new SkipError("생성이 진행 중이라 미룸 (생성이 끝난 뒤 다시 변환)");
+              const deferred = new SkipError("생성이 진행 중이라 미룸 (생성이 끝난 뒤 다시 변환)");
+              deferred.defer = true; // 일시적 사유 — 자동 변환 재시도 횟수에 세지 않는다
+              throw deferred;
             }
           }
           const result = await convertOne(cache, image);
@@ -1326,6 +1330,7 @@
           const message = error instanceof Error ? error.message : String(error);
           if (error?.skip) {
             run.skipped += 1;
+            if (!error.defer) run.skippedIds.push(image.id);
             run.skipReasons.set(message, (run.skipReasons.get(message) || 0) + 1);
             log.warn("변환 건너뜀", image.id, message);
           } else {
@@ -1639,7 +1644,11 @@
         return;
       }
       for (const img of ready) {
-        if (run.failedIds.includes(img.id)) state.autoFailures.set(img.id, (state.autoFailures.get(img.id) || 0) + 1);
+        // 실패뿐 아니라 영구 사유로 건너뛴 삽화("다른 답변 버전 본문에 직접 링크" 등)도 횟수에 센다.
+        // 안 그러면 그 삽화가 남아 있는 한 점검 틱마다 관련 방 전체를 다시 읽고 토스트를 반복한다.
+        if (run.failedIds.includes(img.id) || run.skippedIds.includes(img.id)) {
+          state.autoFailures.set(img.id, (state.autoFailures.get(img.id) || 0) + 1);
+        }
         else state.autoFirstSeen.delete(img.id);
       }
       const converted = run.converted ?? 0;
